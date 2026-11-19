@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Governed Service Assistant</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <header class="site-header">
+      <div>
+        <p class="eyebrow">LOCAL GOVERNED AI PROTOTYPE</p>
+        <h1>AI Service Assistant</h1>
+      </div>
+      <span class="local-badge">Synthetic data · Local only</span>
+    </header>
+
+    <main>
+      <section class="notice" aria-label="Prototype limitation">
+        <strong>Prototype:</strong> policy answers use local extractive retrieval; eligibility and
+        requests use mock services. A named reviewer must approve requests before execution.
+      </section>
+
+      <div class="workspace">
+        <section class="panel conversation-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">POLICY INTELLIGENCE</p>
+              <h2>Ask about a service</h2>
+            </div>
+          </div>
+          <div id="messages" class="messages" aria-live="polite">
+            <p class="empty-state">Ask about eligibility, required documents, fees, or timelines.</p>
+          </div>
+          <form id="chat-form" class="stack">
+            <label for="question">Your question</label>
+            <textarea id="question" name="question" rows="3" maxlength="4000" required
+              placeholder="What documents are required for rental assistance?"></textarea>
+            <div class="form-footer">
+              <span id="chat-status" class="status" role="status"></span>
+              <button type="submit">Ask policy assistant</button>
+            </div>
+          </form>
+        </section>
+
+        <div class="right-column">
+          <section class="panel">
+            <p class="eyebrow">MOCK BACK-END TOOL</p>
+            <h2>Eligibility check</h2>
+            <form id="eligibility-form" class="stack">
+              <label for="eligibility-customer">Synthetic customer</label>
+              <select id="eligibility-customer" name="customer_id">
+                <option value="C-1001">C-1001 · sample eligible</option>
+                <option value="C-1002">C-1002 · sample income check fails</option>
+                <option value="C-1003">C-1003 · sample residency check fails</option>
+              </select>
+              <input type="hidden" name="service_code" value="RENTAL_ASSISTANCE">
+              <button type="submit" class="secondary">Verify against mock API</button>
+            </form>
+            <p id="eligibility-result" class="result" role="status">No check run yet.</p>
+          </section>
+
+          <section class="panel">
+            <p class="eyebrow">HUMAN APPROVAL REQUIRED</p>
+            <h2>Prepare a service request</h2>
+            <form id="request-form" class="stack">
+              <label for="request-customer">Synthetic customer</label>
+              <select id="request-customer" name="customer_id">
+                <option value="C-1001">C-1001</option>
+                <option value="C-1002">C-1002</option>
+                <option value="C-1003">C-1003</option>
+              </select>
+              <input type="hidden" name="service_code" value="RENTAL_ASSISTANCE">
+              <label for="requester">Request prepared by</label>
+              <input id="requester" name="actor_id" value="staff-demo" maxlength="80" required>
+              <button type="submit">Prepare request (does not execute)</button>
+            </form>
+            <div id="request-result" class="result" aria-live="polite">No request prepared.</div>
+            <label for="reviewer" class="queue-reviewer-label">Reviewer ID for queue actions</label>
+            <input id="reviewer" value="reviewer-demo" maxlength="80" autocomplete="off">
+            <h3 class="queue-title">Pending approval queue</h3>
+            <ol id="pending-requests" class="pending-requests" aria-live="polite">
+              <li class="empty-state">Loading pending requests…</li>
+            </ol>
+            <h3 class="queue-title">Approved, awaiting execution</h3>
+            <ol id="approved-requests" class="pending-requests" aria-live="polite">
+              <li class="empty-state">Loading approved requests…</li>
+            </ol>
+          </section>
+
+          <section class="panel audit-panel">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">TRACEABILITY</p>
+                <h2>Audit history</h2>
+              </div>
+              <button id="refresh-audit" class="text-button" type="button">Refresh</button>
+            </div>
+            <ol id="audit-events" class="audit-events">
+              <li class="empty-state">No events recorded yet.</li>
+            </ol>
+          </section>
+        </div>
+      </div>
+    </main>
+    <script src="/app.js" defer></script>
+  </body>
+</html>

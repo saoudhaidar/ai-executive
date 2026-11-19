@@ -1,0 +1,2 @@
+"""Local governed-assistant prototype."""
+
