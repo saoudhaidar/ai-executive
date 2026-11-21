@@ -13,6 +13,7 @@ class Settings:
     ollama_guardian_model: str = ""
     ollama_simple_model: str = "qwen3.5:4b"
     ollama_complex_model: str = "qwen3.5:9b"
+    tool_planner: str = "rules"
     max_input_tokens: int = 2_000
     max_output_tokens: int = 300
     max_conversation_turns: int = 20
@@ -36,6 +37,8 @@ class Settings:
             or self.max_session_cost_usd <= 0
         ):
             raise ValueError("max_session_cost_usd must be a positive finite number")
+        if self.tool_planner not in {"rules", "ollama"}:
+            raise ValueError("tool_planner must be rules or ollama")
         if self.model_mode not in {"deterministic", "ollama"}:
             raise ValueError("model_mode must be deterministic or ollama")
         if (
@@ -62,6 +65,7 @@ class Settings:
             ollama_guardian_model=os.getenv("ASSISTANT_OLLAMA_GUARDIAN_MODEL", ""),
             ollama_simple_model=os.getenv("ASSISTANT_OLLAMA_SIMPLE_MODEL", "qwen3.5:4b"),
             ollama_complex_model=os.getenv("ASSISTANT_OLLAMA_COMPLEX_MODEL", "qwen3.5:9b"),
+            tool_planner=os.getenv("ASSISTANT_TOOL_PLANNER", "rules").lower(),
             max_input_tokens=_env_int("ASSISTANT_MAX_INPUT_TOKENS", 2_000),
             max_output_tokens=_env_int("ASSISTANT_MAX_OUTPUT_TOKENS", 300),
             max_conversation_turns=_env_int("ASSISTANT_MAX_CONVERSATION_TURNS", 20),

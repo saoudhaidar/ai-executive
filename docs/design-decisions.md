@@ -19,3 +19,15 @@ The application stores workflow state in SQLite and checks it again at execution
 ## Minimize audit data
 
 Events store actor role labels, opaque request IDs, policy references, model profile, usage, decisions, and outcomes, but not raw actor IDs, full user prompts, or customer IDs. A schema migration redacts legacy actor IDs and filters legacy event details. This supports a basic event timeline while reducing unnecessary personal data. Production retention, access, integrity, and deletion policies remain required.
+
+## Let planners propose tool calls, but let code decide
+
+The chat can turn a request into a tool call, but the planner (rules, or a local function-calling model) only produces a proposal. The service checks it against a registry that has no approve or execute tool, validates the arguments, requires the customer ID to appear in the staff message, and enforces the business precondition that only eligible customers get a draft. This keeps the language model outside the trust boundary for side effects: a hallucinated or injected tool call fails validation instead of reaching a back end. The cost is a small amount of per-tool validation code and a deliberately narrow rule-based intent detector.
+
+## Make the audit trail tamper-evident
+
+Each audit event stores the previous event's hash and its own SHA-256 over the canonical fields, so editing or deleting a row breaks the chain from that point. This is cheap, dependency-free, and easy to verify in a demo. It detects tampering but does not prevent it: someone with write access can rebuild the whole chain. Production should anchor the head hash periodically in write-once storage or a separate signing service.
+
+## Treat guardrail blocks as refusals
+
+When the optional guardian model flags a prompt, the assistant refuses and records which guardrail fired. Falling back to the offline provider in that case would still answer a prompt a safety control rejected. Transport errors and malformed model output still degrade to the offline provider, because those are availability problems, not safety verdicts.

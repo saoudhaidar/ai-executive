@@ -338,3 +338,20 @@ button:focus-visible {
     flex-direction: column;
   }
 }
+
+.audit-integrity {
+  margin: 0 0 0.75rem;
+  font-size: 0.8rem;
+  color: #2f6b3a;
+}
+
+.audit-integrity.error {
+  color: #a13b2c;
+}
+
+.tool-call {
+  display: block;
+  margin-top: 0.35rem;
+  color: #315a8a;
+  font-weight: 600;
+}

@@ -18,7 +18,8 @@
     <main>
       <section class="notice" aria-label="Prototype limitation">
         <strong>Prototype:</strong> policy answers use local extractive retrieval; eligibility and
-        requests use mock services. A named reviewer must approve requests before execution.
+        requests use mock services. The assistant can check eligibility and draft requests, but
+        only a different named reviewer can approve one before execution.
       </section>
 
       <div class="workspace">
@@ -30,7 +31,7 @@
             </div>
           </div>
           <div id="messages" class="messages" aria-live="polite">
-            <p class="empty-state">Ask about eligibility, required documents, fees, or timelines.</p>
+            <p class="empty-state">Ask about eligibility, required documents, fees, or timelines — or ask the assistant to check eligibility or draft a request for a synthetic customer, e.g. “Raise a rental assistance request for C-1001”.</p>
           </div>
           <form id="chat-form" class="stack">
             <label for="question">Your question</label>
@@ -38,7 +39,7 @@
               placeholder="What documents are required for rental assistance?"></textarea>
             <div class="form-footer">
               <span id="chat-status" class="status" role="status"></span>
-              <button type="submit">Ask policy assistant</button>
+              <button type="submit">Ask assistant</button>
             </div>
           </form>
         </section>
@@ -96,6 +97,7 @@
               </div>
               <button id="refresh-audit" class="text-button" type="button">Refresh</button>
             </div>
+            <p id="audit-integrity" class="audit-integrity" role="status">Verifying audit chain…</p>
             <ol id="audit-events" class="audit-events">
               <li class="empty-state">No events recorded yet.</li>
             </ol>

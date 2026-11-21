@@ -12,6 +12,7 @@ const elements = {
   pendingRequests: document.querySelector("#pending-requests"),
   approvedRequests: document.querySelector("#approved-requests"),
   auditEvents: document.querySelector("#audit-events"),
+  auditIntegrity: document.querySelector("#audit-integrity"),
 };
 
 async function postJson(path, payload) {
@@ -57,6 +58,16 @@ function addMessage(role, text, result) {
     }
     article.append(details);
   }
+  if (result?.tool_call) {
+    const tool = document.createElement("small");
+    tool.className = "tool-call";
+    const gate = result.tool_call.requires_human_approval ? " · human approval required" : "";
+    tool.textContent =
+      `Tool: ${result.tool_call.name} · planner: ${result.tool_call.planner}` +
+      (result.tool_call.side_effect ? ` · ${result.tool_call.side_effect}` : "") +
+      gate;
+    article.append(tool);
+  }
   if (result?.model) {
     const metadata = document.createElement("small");
     metadata.textContent =
@@ -74,7 +85,7 @@ document.querySelector("#chat-form").addEventListener("submit", async (event) =>
   event.preventDefault();
   const question = document.querySelector("#question").value.trim();
   if (!question) return;
-  elements.chatStatus.textContent = "Searching approved policies…";
+  elements.chatStatus.textContent = "Working…";
   elements.chatStatus.classList.remove("error");
   addMessage("user", question);
   try {
@@ -86,6 +97,11 @@ document.querySelector("#chat-form").addEventListener("submit", async (event) =>
     addMessage("assistant", result.answer, result);
     elements.chatStatus.textContent = "";
     document.querySelector("#question").value = "";
+    if (result.tool_call?.request) {
+      activeRequest = result.tool_call.request;
+      renderRequest();
+      await refreshRequests();
+    }
     await refreshAudit();
   } catch (error) {
     elements.chatStatus.textContent = error.message;
@@ -256,7 +272,24 @@ function createActionButton(label, className, action) {
   return button;
 }
 
+async function refreshAuditIntegrity() {
+  try {
+    const response = await fetch("/api/audit/verify", { cache: "no-store" });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || "Could not verify audit chain.");
+    elements.auditIntegrity.classList.toggle("error", !result.valid);
+    elements.auditIntegrity.textContent = result.valid
+      ? `Hash chain intact · ${result.checked} events` +
+        (result.head_hash ? ` · head ${result.head_hash.slice(0, 12)}` : "")
+      : `Hash chain broken at event ${result.first_invalid_id}`;
+  } catch (error) {
+    elements.auditIntegrity.classList.add("error");
+    elements.auditIntegrity.textContent = error.message;
+  }
+}
+
 async function refreshAudit() {
+  refreshAuditIntegrity();
   try {
     const response = await fetch("/api/audit", { cache: "no-store" });
     const result = await response.json();

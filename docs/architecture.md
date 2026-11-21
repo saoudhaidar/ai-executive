@@ -31,6 +31,13 @@ Browser input, retrieved policy text, and mock-service responses are untrusted d
 4. `ModelRouter` selects a configured profile. Deterministic mode uses `local-small` or `local-reasoning`; optional Ollama mode uses `qwen3.5:4b` or `qwen3.5:9b` and validates every returned `[Document §Section]` citation. Provider failures or budget overflow use deterministic extraction; no passages means an explicit “not found” response.
 5. The service returns answer, document/section/excerpt citations, route, whitespace-estimated token counts, illustrative simulated cost and latency, and writes a minimized audit event.
 
+### Chat tool call
+
+1. After input screening, the configured planner inspects the message. The rule-based planner needs a `C-####` customer ID plus explicit eligibility or request wording; the optional Ollama planner uses local function calling with the same registered tool schemas.
+2. `validate_proposal` rejects tools that are not registered, missing or unexpected arguments, values that fail the schema, and customer IDs that do not appear in the staff message.
+3. `check_eligibility` calls the read-only eligibility path. `prepare_service_request` runs the eligibility check first and drafts a `PENDING_APPROVAL` request only for an `ELIGIBLE` result. No tool can approve or execute.
+4. A `tool_call_planned` audit event records the tool, planner, side-effect class, and outcome, without the customer ID.
+
 ### Eligibility
 
 `POST /api/eligibility` validates the synthetic customer ID and service code, enforces the tool-attempt limit, then calls the mock eligibility backend. Its result is labeled as a back-end decision, distinct from policy guidance.
@@ -57,7 +64,7 @@ stateDiagram-v2
 - **API:** JSON over same-origin HTTP; errors use 4xx/5xx status codes and an `error` field. The development server binds to loopback.
 - **Policy source of truth:** Markdown files in `data/policies/`; the index is rebuilt in memory at startup.
 - **Workflow source of truth:** SQLite `service_requests`, updated only through state-checked service methods.
-- **Audit source of truth:** append-only-by-convention SQLite `audit_events`; role labels replace raw actor IDs, and question text, customer IDs, and free-form customer data are not included. Workflow records are separate and do contain synthetic customer IDs to support the demo.
+- **Audit source of truth:** SQLite `audit_events`, hash-chained with SHA-256 (`prev_hash`, `entry_hash`) so `GET /api/audit/verify` can find the first edited or deleted row; role labels replace raw actor IDs, and question text, customer IDs, and free-form customer data are not included. Workflow records are separate and do contain synthetic customer IDs to support the demo.
 - **External systems:** in-process mock APIs; deterministic mode makes no network calls. Optional Ollama mode makes loopback-only calls to the configured local endpoint.
 
 ## Routing, limits, and observability

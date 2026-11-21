@@ -1,3 +1,4 @@
+import hashlib
 import json
 import re
 import sqlite3
@@ -14,8 +15,14 @@ from .backends import (
     MockServiceRequestAPI,
 )
 from .config import Settings
-from .models import LocalExtractiveProvider, ModelRouter, OllamaProvider
+from .models import LocalExtractiveProvider, ModelRouter, OllamaProvider, PromptBlocked
 from .rag import PolicyIndex, is_prompt_injection
+from .tools import (
+    OllamaToolPlanner,
+    RuleBasedToolPlanner,
+    ToolValidationError,
+    validate_proposal,
+)
 
 
 SERVICE_CODES = {"RENTAL_ASSISTANCE"}
@@ -57,12 +64,25 @@ AUDIT_DETAIL_FIELDS = {
     "request_execution_started": set(),
     "request_execution_failed": {"reason"},
     "request_executed": {"external_status"},
+    "tool_call_planned": {"tool", "planner", "side_effect", "outcome"},
     "session_budget_blocked": {
         "estimated_cost_usd",
         "session_budget_usd",
         "cost_basis",
     },
 }
+
+
+AUDIT_GENESIS_HASH = "0" * 64
+
+
+def _audit_entry_hash(prev_hash, timestamp, event_type, actor_role, request_id, details_json):
+    """Hash an audit row together with its predecessor to make edits detectable."""
+    canonical = json.dumps(
+        [prev_hash, timestamp, event_type, actor_role, request_id, details_json],
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 class AssistantError(Exception):
@@ -103,6 +123,7 @@ class AssistantService:
         request_api=None,
         model_provider=None,
         clock=None,
+        tool_planner=None,
     ):
         self.settings = settings if settings is not None else Settings.from_env()
         self.index = PolicyIndex(policy_directory)
@@ -134,6 +155,16 @@ class AssistantService:
             simple_model,
             complex_model,
         )
+        if tool_planner is not None:
+            self.tool_planner = tool_planner
+        elif self.settings.tool_planner == "ollama":
+            self.tool_planner = OllamaToolPlanner(
+                endpoint=self.settings.ollama_endpoint,
+                model=self.settings.ollama_simple_model,
+                timeout_seconds=self.settings.ollama_timeout_seconds,
+            )
+        else:
+            self.tool_planner = RuleBasedToolPlanner()
         self._initialize_database()
         if self.index.filtered_instruction_count:
             self._audit(
@@ -151,25 +182,11 @@ class AssistantService:
             raise LimitExceeded("The question exceeds the configured input limit.")
 
         if is_prompt_injection(question):
-            self._audit(
-                "prompt_injection_blocked",
-                "staff",
-                guardrail="prompt_injection",
-                outcome="blocked",
-            )
-            return {
-                "answer": "I can't follow instructions that attempt to override the assistant's safety rules.",
-                "citations": [],
-                "model": None,
-                "provider": None,
-                "usage": {
-                    "input_tokens": input_tokens,
-                    "output_tokens": 0,
-                    "estimated_cost_usd": 0.0,
-                    "latency_ms": 0,
-                    "cost_basis": "no model call",
-                },
-            }
+            return self._blocked_response("prompt_injection", input_tokens)
+
+        proposal = self.tool_planner.plan(question)
+        if proposal is not None:
+            return self._run_tool(proposal, question, conversation_id, actor_id, input_tokens)
 
         started = time.monotonic()
         passages = self.index.retrieve(question)
@@ -193,12 +210,15 @@ class AssistantService:
                     self.settings.max_output_tokens,
                 )
             else:
-                result = self.router.provider.generate(
-                    selected_model,
-                    question,
-                    passages,
-                    self.settings.max_output_tokens,
-                )
+                try:
+                    result = self.router.provider.generate(
+                        selected_model,
+                        question,
+                        passages,
+                        self.settings.max_output_tokens,
+                    )
+                except PromptBlocked as blocked:
+                    return self._blocked_response(blocked.guardrail, input_tokens)
             answer = result.answer
             usage = {
                 "input_tokens": result.input_tokens,
@@ -278,6 +298,112 @@ class AssistantService:
             "model": selected_model,
             "provider": provider,
             "usage": usage,
+        }
+
+    def _run_tool(self, proposal, question, conversation_id, actor_id, input_tokens):
+        """Validate a planner proposal, then dispatch it through the governed service methods."""
+        try:
+            spec = validate_proposal(proposal, question)
+        except ToolValidationError as error:
+            self._audit(
+                "tool_call_planned",
+                "system",
+                tool=proposal.name,
+                planner=proposal.planner,
+                outcome="rejected_invalid_proposal",
+            )
+            return self._tool_response(
+                f"I could not run that action: {error}", proposal, None, None, input_tokens
+            )
+
+        arguments = proposal.arguments
+        eligibility = self.verify_eligibility(
+            arguments["customer_id"],
+            arguments["service_code"],
+            actor_id,
+            session_id=conversation_id,
+        )
+        request = None
+        if spec.name == "check_eligibility":
+            outcome = eligibility["outcome"].lower()
+            answer = (
+                f"Back-end eligibility result for {arguments['customer_id']}: "
+                f"{eligibility['outcome']}. {eligibility['reason']} "
+                "This is a system decision, not policy guidance."
+            )
+        elif eligibility["outcome"] != "ELIGIBLE":
+            # Business precondition: never queue a request the back end would refuse.
+            outcome = "not_drafted_ineligible"
+            answer = (
+                f"I did not draft a request for {arguments['customer_id']}: the eligibility "
+                f"check returned {eligibility['outcome']}. {eligibility['reason']}"
+            )
+        else:
+            request = self.prepare_request(
+                arguments["customer_id"],
+                arguments["service_code"],
+                actor_id,
+                session_id=conversation_id,
+            )
+            outcome = "drafted_pending_approval"
+            answer = (
+                f"Eligibility confirmed. I drafted request {request['id'][:8]} for "
+                f"{arguments['customer_id']}; it is waiting for a different reviewer to "
+                "approve it. Nothing has been submitted."
+            )
+        self._audit(
+            "tool_call_planned",
+            "system",
+            tool=spec.name,
+            planner=proposal.planner,
+            side_effect=spec.side_effect,
+            outcome=outcome,
+        )
+        return self._tool_response(answer, proposal, eligibility, request, input_tokens, spec)
+
+    def _tool_response(self, answer, proposal, eligibility, request, input_tokens, spec=None):
+        return {
+            "answer": answer,
+            "citations": [],
+            "model": None,
+            "provider": None,
+            "tool_call": {
+                "name": proposal.name,
+                "planner": proposal.planner,
+                "arguments": proposal.arguments,
+                "side_effect": spec.side_effect if spec else None,
+                "requires_human_approval": spec.requires_human_approval if spec else None,
+                "eligibility": eligibility,
+                "request": request,
+            },
+            "usage": {
+                "input_tokens": input_tokens,
+                "output_tokens": _token_count(answer),
+                "estimated_cost_usd": 0.0,
+                "latency_ms": 0,
+                "cost_basis": f"tool planner: {proposal.planner}",
+            },
+        }
+
+    def _blocked_response(self, guardrail, input_tokens):
+        self._audit(
+            "prompt_injection_blocked",
+            "staff",
+            guardrail=guardrail,
+            outcome="blocked",
+        )
+        return {
+            "answer": "I can't follow instructions that attempt to override the assistant's safety rules.",
+            "citations": [],
+            "model": None,
+            "provider": None,
+            "usage": {
+                "input_tokens": input_tokens,
+                "output_tokens": 0,
+                "estimated_cost_usd": 0.0,
+                "latency_ms": 0,
+                "cost_basis": "no model call",
+            },
         }
 
     def verify_eligibility(self, customer_id, service_code, actor_id, session_id=None):
@@ -632,19 +758,61 @@ class AssistantService:
         request_id = details.pop("request_id", None)
         safe_role = actor_role if actor_role in AUDIT_ROLES else "system"
         safe_details = _sanitize_audit_details(event_type, details)
+        if not connection.in_transaction:
+            # Serialise chain extension so concurrent writers cannot fork the chain.
+            connection.execute("BEGIN IMMEDIATE")
+        previous = connection.execute(
+            "SELECT entry_hash FROM audit_events ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        prev_hash = previous["entry_hash"] if previous else AUDIT_GENESIS_HASH
+        timestamp = self._now().isoformat()
+        details_json = json.dumps(safe_details, separators=(",", ":"), sort_keys=True)
+        entry_hash = _audit_entry_hash(
+            prev_hash, timestamp, event_type, safe_role, request_id, details_json
+        )
         connection.execute(
             """
-            INSERT INTO audit_events (timestamp, event_type, actor_role, request_id, details_json)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO audit_events
+                (timestamp, event_type, actor_role, request_id, details_json, prev_hash, entry_hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (
-                self._now().isoformat(),
-                event_type,
-                safe_role,
-                request_id,
-                json.dumps(safe_details, separators=(",", ":"), sort_keys=True),
-            ),
+            (timestamp, event_type, safe_role, request_id, details_json, prev_hash, entry_hash),
         )
+
+    def verify_audit_chain(self):
+        """Recompute every audit hash; report the first row that was altered or removed."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, timestamp, event_type, actor_role, request_id, details_json,
+                       prev_hash, entry_hash
+                FROM audit_events ORDER BY id
+                """
+            ).fetchall()
+        expected_prev = AUDIT_GENESIS_HASH
+        for row in rows:
+            recomputed = _audit_entry_hash(
+                expected_prev,
+                row["timestamp"],
+                row["event_type"],
+                row["actor_role"],
+                row["request_id"],
+                row["details_json"],
+            )
+            if row["prev_hash"] != expected_prev or row["entry_hash"] != recomputed:
+                return {
+                    "valid": False,
+                    "checked": len(rows),
+                    "first_invalid_id": row["id"],
+                    "head_hash": None,
+                }
+            expected_prev = row["entry_hash"]
+        return {
+            "valid": True,
+            "checked": len(rows),
+            "first_invalid_id": None,
+            "head_hash": expected_prev if rows else None,
+        }
 
     def _initialize_database(self):
         with self._connect() as connection:
@@ -669,7 +837,9 @@ class AssistantService:
                     event_type TEXT NOT NULL,
                     actor_role TEXT NOT NULL,
                     request_id TEXT,
-                    details_json TEXT NOT NULL
+                    details_json TEXT NOT NULL,
+                    prev_hash TEXT,
+                    entry_hash TEXT
                 );
                 CREATE TABLE IF NOT EXISTS assistant_sessions (
                     id TEXT PRIMARY KEY,
@@ -730,6 +900,43 @@ class AssistantService:
                 connection.execute("DROP TABLE audit_events_legacy")
             elif "actor_role" not in columns:
                 raise sqlite3.DatabaseError("Unsupported audit_events schema.")
+        self._ensure_audit_chain()
+
+    def _ensure_audit_chain(self):
+        """Add hash-chain columns to older databases and backfill existing rows."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(audit_events)")
+            }
+            for column in ("prev_hash", "entry_hash"):
+                if column not in columns:
+                    connection.execute(f"ALTER TABLE audit_events ADD COLUMN {column} TEXT")
+            unchained = connection.execute(
+                "SELECT COUNT(*) AS n FROM audit_events WHERE entry_hash IS NULL"
+            ).fetchone()["n"]
+            if not unchained:
+                return
+            prev_hash = AUDIT_GENESIS_HASH
+            for row in connection.execute(
+                """
+                SELECT id, timestamp, event_type, actor_role, request_id, details_json
+                FROM audit_events ORDER BY id
+                """
+            ).fetchall():
+                entry_hash = _audit_entry_hash(
+                    prev_hash,
+                    row["timestamp"],
+                    row["event_type"],
+                    row["actor_role"],
+                    row["request_id"],
+                    row["details_json"],
+                )
+                connection.execute(
+                    "UPDATE audit_events SET prev_hash = ?, entry_hash = ? WHERE id = ?",
+                    (prev_hash, entry_hash, row["id"]),
+                )
+                prev_hash = entry_hash
 
     @contextmanager
     def _connect(self):
