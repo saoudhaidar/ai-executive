@@ -52,6 +52,20 @@ class AssistantApiTests(unittest.TestCase):
         with response:
             return response.status, json.loads(response.read())
 
+    def test_audit_verify_endpoint_reports_intact_chain(self):
+        self._post(
+            "/api/chat",
+            {
+                "question": "What documents are required for rental assistance?",
+                "conversation_id": "http-audit",
+                "actor_id": "staff-test",
+            },
+        )
+        with urllib.request.urlopen(self.base_url + "/api/audit/verify", timeout=3) as response:
+            result = json.loads(response.read())
+        self.assertTrue(result["valid"])
+        self.assertGreaterEqual(result["checked"], 1)
+
     def test_policy_endpoint_returns_citation_and_local_provider(self):
         status, result = self._post(
             "/api/chat",

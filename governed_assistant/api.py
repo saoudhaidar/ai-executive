@@ -32,6 +32,7 @@ _SAFE_ROUTES = {
     "/styles.css",
     "/api/health",
     "/api/audit",
+    "/api/audit/verify",
     "/api/requests",
     "/api/chat",
     "/api/eligibility",
@@ -227,6 +228,19 @@ def make_server(service, host="127.0.0.1", port=8000):
                 except Exception:
                     LOGGER.exception("Audit history retrieval failed.")
                     self._send_json(500, {"error": "Audit history is temporarily unavailable."})
+                return
+            if route == "/api/audit/verify":
+                try:
+                    verification = service.verify_audit_chain()
+                    LOGGER.info(
+                        "lifecycle operation=audit_verify phase=completed valid=%s checked=%d",
+                        verification["valid"],
+                        verification["checked"],
+                    )
+                    self._send_json(200, verification)
+                except Exception:
+                    LOGGER.exception("Audit chain verification failed.")
+                    self._send_json(500, {"error": "Audit verification is temporarily unavailable."})
                 return
             if route == "/api/requests":
                 query = parse_qs(parsed_path.query, keep_blank_values=True)

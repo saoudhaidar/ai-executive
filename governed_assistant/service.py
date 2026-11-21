@@ -1,3 +1,4 @@
+import hashlib
 import json
 import re
 import sqlite3
@@ -63,6 +64,18 @@ AUDIT_DETAIL_FIELDS = {
         "cost_basis",
     },
 }
+
+
+AUDIT_GENESIS_HASH = "0" * 64
+
+
+def _audit_entry_hash(prev_hash, timestamp, event_type, actor_role, request_id, details_json):
+    """Hash an audit row together with its predecessor to make edits detectable."""
+    canonical = json.dumps(
+        [prev_hash, timestamp, event_type, actor_role, request_id, details_json],
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 class AssistantError(Exception):
@@ -638,19 +651,61 @@ class AssistantService:
         request_id = details.pop("request_id", None)
         safe_role = actor_role if actor_role in AUDIT_ROLES else "system"
         safe_details = _sanitize_audit_details(event_type, details)
+        if not connection.in_transaction:
+            # Serialise chain extension so concurrent writers cannot fork the chain.
+            connection.execute("BEGIN IMMEDIATE")
+        previous = connection.execute(
+            "SELECT entry_hash FROM audit_events ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        prev_hash = previous["entry_hash"] if previous else AUDIT_GENESIS_HASH
+        timestamp = self._now().isoformat()
+        details_json = json.dumps(safe_details, separators=(",", ":"), sort_keys=True)
+        entry_hash = _audit_entry_hash(
+            prev_hash, timestamp, event_type, safe_role, request_id, details_json
+        )
         connection.execute(
             """
-            INSERT INTO audit_events (timestamp, event_type, actor_role, request_id, details_json)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO audit_events
+                (timestamp, event_type, actor_role, request_id, details_json, prev_hash, entry_hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (
-                self._now().isoformat(),
-                event_type,
-                safe_role,
-                request_id,
-                json.dumps(safe_details, separators=(",", ":"), sort_keys=True),
-            ),
+            (timestamp, event_type, safe_role, request_id, details_json, prev_hash, entry_hash),
         )
+
+    def verify_audit_chain(self):
+        """Recompute every audit hash; report the first row that was altered or removed."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, timestamp, event_type, actor_role, request_id, details_json,
+                       prev_hash, entry_hash
+                FROM audit_events ORDER BY id
+                """
+            ).fetchall()
+        expected_prev = AUDIT_GENESIS_HASH
+        for row in rows:
+            recomputed = _audit_entry_hash(
+                expected_prev,
+                row["timestamp"],
+                row["event_type"],
+                row["actor_role"],
+                row["request_id"],
+                row["details_json"],
+            )
+            if row["prev_hash"] != expected_prev or row["entry_hash"] != recomputed:
+                return {
+                    "valid": False,
+                    "checked": len(rows),
+                    "first_invalid_id": row["id"],
+                    "head_hash": None,
+                }
+            expected_prev = row["entry_hash"]
+        return {
+            "valid": True,
+            "checked": len(rows),
+            "first_invalid_id": None,
+            "head_hash": expected_prev if rows else None,
+        }
 
     def _initialize_database(self):
         with self._connect() as connection:
@@ -675,7 +730,9 @@ class AssistantService:
                     event_type TEXT NOT NULL,
                     actor_role TEXT NOT NULL,
                     request_id TEXT,
-                    details_json TEXT NOT NULL
+                    details_json TEXT NOT NULL,
+                    prev_hash TEXT,
+                    entry_hash TEXT
                 );
                 CREATE TABLE IF NOT EXISTS assistant_sessions (
                     id TEXT PRIMARY KEY,
@@ -736,6 +793,43 @@ class AssistantService:
                 connection.execute("DROP TABLE audit_events_legacy")
             elif "actor_role" not in columns:
                 raise sqlite3.DatabaseError("Unsupported audit_events schema.")
+        self._ensure_audit_chain()
+
+    def _ensure_audit_chain(self):
+        """Add hash-chain columns to older databases and backfill existing rows."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(audit_events)")
+            }
+            for column in ("prev_hash", "entry_hash"):
+                if column not in columns:
+                    connection.execute(f"ALTER TABLE audit_events ADD COLUMN {column} TEXT")
+            unchained = connection.execute(
+                "SELECT COUNT(*) AS n FROM audit_events WHERE entry_hash IS NULL"
+            ).fetchone()["n"]
+            if not unchained:
+                return
+            prev_hash = AUDIT_GENESIS_HASH
+            for row in connection.execute(
+                """
+                SELECT id, timestamp, event_type, actor_role, request_id, details_json
+                FROM audit_events ORDER BY id
+                """
+            ).fetchall():
+                entry_hash = _audit_entry_hash(
+                    prev_hash,
+                    row["timestamp"],
+                    row["event_type"],
+                    row["actor_role"],
+                    row["request_id"],
+                    row["details_json"],
+                )
+                connection.execute(
+                    "UPDATE audit_events SET prev_hash = ?, entry_hash = ? WHERE id = ?",
+                    (prev_hash, entry_hash, row["id"]),
+                )
+                prev_hash = entry_hash
 
     @contextmanager
     def _connect(self):

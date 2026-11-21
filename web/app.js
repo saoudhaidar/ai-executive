@@ -12,6 +12,7 @@ const elements = {
   pendingRequests: document.querySelector("#pending-requests"),
   approvedRequests: document.querySelector("#approved-requests"),
   auditEvents: document.querySelector("#audit-events"),
+  auditIntegrity: document.querySelector("#audit-integrity"),
 };
 
 async function postJson(path, payload) {
@@ -256,7 +257,24 @@ function createActionButton(label, className, action) {
   return button;
 }
 
+async function refreshAuditIntegrity() {
+  try {
+    const response = await fetch("/api/audit/verify", { cache: "no-store" });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || "Could not verify audit chain.");
+    elements.auditIntegrity.classList.toggle("error", !result.valid);
+    elements.auditIntegrity.textContent = result.valid
+      ? `Hash chain intact · ${result.checked} events` +
+        (result.head_hash ? ` · head ${result.head_hash.slice(0, 12)}` : "")
+      : `Hash chain broken at event ${result.first_invalid_id}`;
+  } catch (error) {
+    elements.auditIntegrity.classList.add("error");
+    elements.auditIntegrity.textContent = error.message;
+  }
+}
+
 async function refreshAudit() {
+  refreshAuditIntegrity();
   try {
     const response = await fetch("/api/audit", { cache: "no-store" });
     const result = await response.json();
