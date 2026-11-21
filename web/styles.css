@@ -348,3 +348,10 @@ button:focus-visible {
 .audit-integrity.error {
   color: #a13b2c;
 }
+
+.tool-call {
+  display: block;
+  margin-top: 0.35rem;
+  color: #315a8a;
+  font-weight: 600;
+}

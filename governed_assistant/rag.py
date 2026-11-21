@@ -12,7 +12,8 @@ _INJECTION_RE = re.compile(
     r"|\b(reveal|disclose|print|expose)\b.{0,40}\b(system prompt|confidential|secret|credentials?)\b"
     r"|\b(bypass|skip|disable)\b.{0,30}\b(approval|security|review)\b"
     r"|\b(auto[- ]?approve|approve automatically|execute automatically)\b.{0,60}\b(request|application|action)\b"
-    r"|\b(execute|submit|create)\b.{0,40}\b(without|skipping)\b.{0,20}\b(approval|review)\b"
+    r"|\b(execute|submit|create|approve|raise|open|process)\b.{0,40}\b(without|skipping)\b.{0,20}\b(approval|review)\b"
+    r"|\b(approve|execute|submit)\b.{0,20}\b(automatically|immediately|yourself)\b"
     r"|\b(act as|you are now)\b.{0,30}\b(system|developer|administrator)\b",
     re.IGNORECASE,
 )

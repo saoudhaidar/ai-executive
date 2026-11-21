@@ -58,6 +58,16 @@ function addMessage(role, text, result) {
     }
     article.append(details);
   }
+  if (result?.tool_call) {
+    const tool = document.createElement("small");
+    tool.className = "tool-call";
+    const gate = result.tool_call.requires_human_approval ? " · human approval required" : "";
+    tool.textContent =
+      `Tool: ${result.tool_call.name} · planner: ${result.tool_call.planner}` +
+      (result.tool_call.side_effect ? ` · ${result.tool_call.side_effect}` : "") +
+      gate;
+    article.append(tool);
+  }
   if (result?.model) {
     const metadata = document.createElement("small");
     metadata.textContent =
@@ -75,7 +85,7 @@ document.querySelector("#chat-form").addEventListener("submit", async (event) =>
   event.preventDefault();
   const question = document.querySelector("#question").value.trim();
   if (!question) return;
-  elements.chatStatus.textContent = "Searching approved policies…";
+  elements.chatStatus.textContent = "Working…";
   elements.chatStatus.classList.remove("error");
   addMessage("user", question);
   try {
@@ -87,6 +97,11 @@ document.querySelector("#chat-form").addEventListener("submit", async (event) =>
     addMessage("assistant", result.answer, result);
     elements.chatStatus.textContent = "";
     document.querySelector("#question").value = "";
+    if (result.tool_call?.request) {
+      activeRequest = result.tool_call.request;
+      renderRequest();
+      await refreshRequests();
+    }
     await refreshAudit();
   } catch (error) {
     elements.chatStatus.textContent = error.message;

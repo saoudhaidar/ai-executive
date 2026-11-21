@@ -17,6 +17,12 @@ from .backends import (
 from .config import Settings
 from .models import LocalExtractiveProvider, ModelRouter, OllamaProvider, PromptBlocked
 from .rag import PolicyIndex, is_prompt_injection
+from .tools import (
+    OllamaToolPlanner,
+    RuleBasedToolPlanner,
+    ToolValidationError,
+    validate_proposal,
+)
 
 
 SERVICE_CODES = {"RENTAL_ASSISTANCE"}
@@ -58,6 +64,7 @@ AUDIT_DETAIL_FIELDS = {
     "request_execution_started": set(),
     "request_execution_failed": {"reason"},
     "request_executed": {"external_status"},
+    "tool_call_planned": {"tool", "planner", "side_effect", "outcome"},
     "session_budget_blocked": {
         "estimated_cost_usd",
         "session_budget_usd",
@@ -116,6 +123,7 @@ class AssistantService:
         request_api=None,
         model_provider=None,
         clock=None,
+        tool_planner=None,
     ):
         self.settings = settings if settings is not None else Settings.from_env()
         self.index = PolicyIndex(policy_directory)
@@ -147,6 +155,16 @@ class AssistantService:
             simple_model,
             complex_model,
         )
+        if tool_planner is not None:
+            self.tool_planner = tool_planner
+        elif self.settings.tool_planner == "ollama":
+            self.tool_planner = OllamaToolPlanner(
+                endpoint=self.settings.ollama_endpoint,
+                model=self.settings.ollama_simple_model,
+                timeout_seconds=self.settings.ollama_timeout_seconds,
+            )
+        else:
+            self.tool_planner = RuleBasedToolPlanner()
         self._initialize_database()
         if self.index.filtered_instruction_count:
             self._audit(
@@ -165,6 +183,10 @@ class AssistantService:
 
         if is_prompt_injection(question):
             return self._blocked_response("prompt_injection", input_tokens)
+
+        proposal = self.tool_planner.plan(question)
+        if proposal is not None:
+            return self._run_tool(proposal, question, conversation_id, actor_id, input_tokens)
 
         started = time.monotonic()
         passages = self.index.retrieve(question)
@@ -276,6 +298,91 @@ class AssistantService:
             "model": selected_model,
             "provider": provider,
             "usage": usage,
+        }
+
+    def _run_tool(self, proposal, question, conversation_id, actor_id, input_tokens):
+        """Validate a planner proposal, then dispatch it through the governed service methods."""
+        try:
+            spec = validate_proposal(proposal, question)
+        except ToolValidationError as error:
+            self._audit(
+                "tool_call_planned",
+                "system",
+                tool=proposal.name,
+                planner=proposal.planner,
+                outcome="rejected_invalid_proposal",
+            )
+            return self._tool_response(
+                f"I could not run that action: {error}", proposal, None, None, input_tokens
+            )
+
+        arguments = proposal.arguments
+        eligibility = self.verify_eligibility(
+            arguments["customer_id"],
+            arguments["service_code"],
+            actor_id,
+            session_id=conversation_id,
+        )
+        request = None
+        if spec.name == "check_eligibility":
+            outcome = eligibility["outcome"].lower()
+            answer = (
+                f"Back-end eligibility result for {arguments['customer_id']}: "
+                f"{eligibility['outcome']}. {eligibility['reason']} "
+                "This is a system decision, not policy guidance."
+            )
+        elif eligibility["outcome"] != "ELIGIBLE":
+            # Business precondition: never queue a request the back end would refuse.
+            outcome = "not_drafted_ineligible"
+            answer = (
+                f"I did not draft a request for {arguments['customer_id']}: the eligibility "
+                f"check returned {eligibility['outcome']}. {eligibility['reason']}"
+            )
+        else:
+            request = self.prepare_request(
+                arguments["customer_id"],
+                arguments["service_code"],
+                actor_id,
+                session_id=conversation_id,
+            )
+            outcome = "drafted_pending_approval"
+            answer = (
+                f"Eligibility confirmed. I drafted request {request['id'][:8]} for "
+                f"{arguments['customer_id']}; it is waiting for a different reviewer to "
+                "approve it. Nothing has been submitted."
+            )
+        self._audit(
+            "tool_call_planned",
+            "system",
+            tool=spec.name,
+            planner=proposal.planner,
+            side_effect=spec.side_effect,
+            outcome=outcome,
+        )
+        return self._tool_response(answer, proposal, eligibility, request, input_tokens, spec)
+
+    def _tool_response(self, answer, proposal, eligibility, request, input_tokens, spec=None):
+        return {
+            "answer": answer,
+            "citations": [],
+            "model": None,
+            "provider": None,
+            "tool_call": {
+                "name": proposal.name,
+                "planner": proposal.planner,
+                "arguments": proposal.arguments,
+                "side_effect": spec.side_effect if spec else None,
+                "requires_human_approval": spec.requires_human_approval if spec else None,
+                "eligibility": eligibility,
+                "request": request,
+            },
+            "usage": {
+                "input_tokens": input_tokens,
+                "output_tokens": _token_count(answer),
+                "estimated_cost_usd": 0.0,
+                "latency_ms": 0,
+                "cost_basis": f"tool planner: {proposal.planner}",
+            },
         }
 
     def _blocked_response(self, guardrail, input_tokens):

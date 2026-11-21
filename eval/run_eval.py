@@ -1,9 +1,11 @@
 import argparse
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import time
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -11,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from governed_assistant.config import Settings
+from governed_assistant.rag import PolicyIndex
 from governed_assistant.service import (
     ApprovalRequired,
     AssistantService,
@@ -59,6 +62,40 @@ def _evaluate_case(case, workdir, base_service):
             and citation["excerpt"] in result["answer"]
             for citation in citations
         )
+    elif category == "chat-tool":
+        case_service = _new_service(workdir / f"{case['id']}.sqlite3")
+        result = case_service.ask(
+            case["question"],
+            conversation_id=f"eval-{case['id']}",
+            actor_id="evaluation-requester",
+        )
+        tool_call = result.get("tool_call") or {}
+        request = tool_call.get("request")
+        details = {
+            "tool": tool_call.get("name"),
+            "planner": tool_call.get("planner"),
+            "request_state": request["state"] if request else None,
+            "backend_call_count": case_service.request_api.call_count,
+        }
+        passed = (
+            details["tool"] == case["expected_tool"]
+            and details["request_state"] == case.get("expected_request_state")
+            and case_service.request_api.call_count == 0
+        )
+    elif category == "audit-integrity":
+        database_path = workdir / f"{case['id']}.sqlite3"
+        case_service = _new_service(database_path)
+        request = case_service.prepare_request("C-1001", "RENTAL_ASSISTANCE", "evaluation-requester")
+        case_service.approve_request(request["id"], "evaluation-reviewer")
+        intact = case_service.verify_audit_chain()["valid"]
+        with closing(sqlite3.connect(database_path)) as connection:
+            connection.execute(
+                "UPDATE audit_events SET actor_role = 'staff' WHERE event_type = 'request_approved'"
+            )
+            connection.commit()
+        tampered = case_service.verify_audit_chain()
+        details = {"intact_before": intact, "detected_after_edit": not tampered["valid"]}
+        passed = intact and not tampered["valid"]
     elif category == "policy-refusal":
         result = base_service.ask(
             case["question"],
@@ -254,7 +291,36 @@ def run_evaluation(cases_path=None):
             "python": os.sys.version.split()[0],
         },
         "categories": _category_summary(results),
+        "retrieval": _retrieval_metrics(cases),
         "results": results,
+    }
+
+
+def _retrieval_metrics(cases, k=5):
+    """Hit rate and MRR of the expected document/section among the top-k passages."""
+    index = PolicyIndex(ROOT / "data" / "policies")
+    reciprocal_ranks = []
+    for case in cases:
+        if case["category"] != "policy-answer":
+            continue
+        passages = index.retrieve(case["question"], limit=k)
+        rank = next(
+            (
+                position
+                for position, passage in enumerate(passages, start=1)
+                if passage["document"] == case["document"]
+                and passage["section"] == case["section"]
+            ),
+            None,
+        )
+        reciprocal_ranks.append(1 / rank if rank else 0.0)
+    if not reciprocal_ranks:
+        return {"k": k, "cases": 0, "hit_rate": None, "mrr": None}
+    return {
+        "k": k,
+        "cases": len(reciprocal_ranks),
+        "hit_rate": round(sum(1 for rr in reciprocal_ranks if rr) / len(reciprocal_ranks), 4),
+        "mrr": round(sum(reciprocal_ranks) / len(reciprocal_ranks), 4),
     }
 
 
@@ -277,7 +343,7 @@ def main(argv=None, default_cases=None):
         "--cases",
         type=Path,
         default=default_cases,
-        help="JSON dataset path (defaults to the 20-case regression dataset).",
+        help="JSON dataset path (defaults to the 25-case regression dataset).",
     )
     arguments = parser.parse_args(argv)
     report = run_evaluation(arguments.cases)
@@ -294,6 +360,12 @@ def main(argv=None, default_cases=None):
         f"${report['simulated_cost_usd']:.8f} "
         "(illustrative local profile rates; not billed)"
     )
+    retrieval = report["retrieval"]
+    if retrieval["cases"]:
+        print(
+            f"Retrieval (top-{retrieval['k']}, {retrieval['cases']} cases): "
+            f"hit rate {retrieval['hit_rate']:.2f}, MRR {retrieval['mrr']:.2f}"
+        )
     print(f"{'CASE':<34} {'CATEGORY':<18} {'RESULT':<8} {'LATENCY':>12}")
     print("-" * 76)
     for result in report["results"]:
