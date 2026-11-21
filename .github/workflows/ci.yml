@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-evaluate:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+      - name: Evaluation gate (fails on any regression)
+        run: python eval/run_eval.py
+      - name: Upload evaluation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report-py${{ matrix.python-version }}
+          path: eval/latest_report.json
+
+  container:
+    runs-on: ubuntu-latest
+    needs: test-and-evaluate
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t governed-assistant:ci .
+      - name: Smoke test
+        run: |
+          docker run -d --name assistant -p 8000:8000 governed-assistant:ci
+          for i in $(seq 1 20); do
+            curl -fsS http://127.0.0.1:8000/api/health && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8000/api/audit/verify
+          docker rm -f assistant

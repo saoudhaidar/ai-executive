@@ -1,0 +1,9 @@
+.git
+.github
+.data
+__pycache__
+*.py[cod]
+tests
+eval
+docs
+scripts
