@@ -14,7 +14,7 @@ from .backends import (
     MockServiceRequestAPI,
 )
 from .config import Settings
-from .models import LocalExtractiveProvider, ModelRouter, OllamaProvider
+from .models import LocalExtractiveProvider, ModelRouter, OllamaProvider, PromptBlocked
 from .rag import PolicyIndex, is_prompt_injection
 
 
@@ -151,25 +151,7 @@ class AssistantService:
             raise LimitExceeded("The question exceeds the configured input limit.")
 
         if is_prompt_injection(question):
-            self._audit(
-                "prompt_injection_blocked",
-                "staff",
-                guardrail="prompt_injection",
-                outcome="blocked",
-            )
-            return {
-                "answer": "I can't follow instructions that attempt to override the assistant's safety rules.",
-                "citations": [],
-                "model": None,
-                "provider": None,
-                "usage": {
-                    "input_tokens": input_tokens,
-                    "output_tokens": 0,
-                    "estimated_cost_usd": 0.0,
-                    "latency_ms": 0,
-                    "cost_basis": "no model call",
-                },
-            }
+            return self._blocked_response("prompt_injection", input_tokens)
 
         started = time.monotonic()
         passages = self.index.retrieve(question)
@@ -193,12 +175,15 @@ class AssistantService:
                     self.settings.max_output_tokens,
                 )
             else:
-                result = self.router.provider.generate(
-                    selected_model,
-                    question,
-                    passages,
-                    self.settings.max_output_tokens,
-                )
+                try:
+                    result = self.router.provider.generate(
+                        selected_model,
+                        question,
+                        passages,
+                        self.settings.max_output_tokens,
+                    )
+                except PromptBlocked as blocked:
+                    return self._blocked_response(blocked.guardrail, input_tokens)
             answer = result.answer
             usage = {
                 "input_tokens": result.input_tokens,
@@ -278,6 +263,27 @@ class AssistantService:
             "model": selected_model,
             "provider": provider,
             "usage": usage,
+        }
+
+    def _blocked_response(self, guardrail, input_tokens):
+        self._audit(
+            "prompt_injection_blocked",
+            "staff",
+            guardrail=guardrail,
+            outcome="blocked",
+        )
+        return {
+            "answer": "I can't follow instructions that attempt to override the assistant's safety rules.",
+            "citations": [],
+            "model": None,
+            "provider": None,
+            "usage": {
+                "input_tokens": input_tokens,
+                "output_tokens": 0,
+                "estimated_cost_usd": 0.0,
+                "latency_ms": 0,
+                "cost_basis": "no model call",
+            },
         }
 
     def verify_eligibility(self, customer_id, service_code, actor_id, session_id=None):
